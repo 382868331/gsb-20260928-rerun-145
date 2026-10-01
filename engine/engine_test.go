@@ -267,6 +267,117 @@ func TestTieBreakDeterministic(t *testing.T) {
 	}
 }
 
+// Mixed chords, long presses and switches across focus loss, device removal
+// and context restore: teardown resets holds and latches exactly once,
+// stale releases never cancel new-round actions, nothing stays active, and
+// a saved (JSON round-tripped) config replays the identical stream.
+func TestMixedTeardownAndReplayConsistency(t *testing.T) {
+	raw := config.Config{LongPressMs: 500, Bindings: baseBindings()}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loaded config.Config
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatal(err)
+	}
+	c1, err := config.Compile(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := config.Compile(loaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(cfg *config.Compiled) ([]engine.Event, *engine.Engine) {
+		kbd := device.NewVirtualKeyboard()
+		eng := engine.New(cfg)
+		var out []engine.Event
+		feed := func(tt int64, key device.Key, ph device.Phase) {
+			if edge, ok := kbd.Push(device.Event{Key: key, Phase: ph}); ok {
+				out = append(out, eng.ApplyEdge(edge, tt)...)
+			}
+		}
+		press := func(tt int64, key device.Key) { feed(tt, key, device.Press) }
+		release := func(tt int64, key device.Key) { feed(tt, key, device.Release) }
+
+		press(0, "Shift")                     // run+
+		press(10, "L")                        // flashlight+ (latch on)
+		press(20, "C")                        // long-press pending
+		out = append(out, eng.Blur(30)...)    // teardown: flashlight-, run-
+		out = append(out, eng.Update(530)...) // cancelled long press must not fire
+		release(40, "Shift")                  // stale releases from before the blur
+		release(50, "L")
+		release(60, "C")
+		press(70, "Shift") // new round: run+ again
+		press(80, "Ctrl")
+		press(90, "Q") // chord: quit+
+		release(100, "Q")
+		release(110, "Ctrl")
+		press(120, "L")
+		release(130, "L")                            // latch on again
+		out = append(out, eng.DeviceRemoved(140)...) // flashlight-, run-
+		release(150, "Shift")                        // stale release from the removed device
+		press(160, "C")
+		out = append(out, eng.Update(700)...) // crouch! after 540ms
+		release(710, "C")
+		press(720, "Tab") // ctx default->menu
+		release(725, "Tab") // stale release swallowed by the engine
+		press(730, "P")
+		release(740, "P")   // pause!
+		press(750, "Tab")   // ctx menu->default (context restore)
+		release(760, "Tab") // stale release carried across the switches
+		press(770, "Space")
+		release(780, "Space") // jump!
+		return out, eng
+	}
+
+	want := []string{
+		"run+ ", "flashlight+ ",
+		"flashlight- ", "run- ", // blur teardown
+		"run+ ",
+		"quit+ ", "quit- ",
+		"flashlight+ ",
+		"flashlight- ", "run- ", // device removal teardown
+		"crouch!",
+		"ctx:default->menu",
+		"pause!",
+		"ctx:menu->default",
+		"jump!",
+	}
+	for i, cfg := range []*config.Compiled{c1, c2} {
+		out, eng := run(cfg)
+		got := actions(out)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("run %d: got %v want %v", i, got, want)
+		}
+		for _, action := range []string{"run", "quit", "flashlight"} {
+			if eng.Active(action) {
+				t.Fatalf("run %d: %q still active after teardowns", i, action)
+			}
+		}
+		// No duplicate releases: every Deactivate matches a distinct Activate.
+		balance := make(map[string]int)
+		for _, ev := range out {
+			switch ev.Type {
+			case engine.Activate:
+				balance[ev.Action]++
+			case engine.Deactivate:
+				balance[ev.Action]--
+				if balance[ev.Action] < 0 {
+					t.Fatalf("run %d: duplicate release of %q", i, ev.Action)
+				}
+			}
+		}
+		for action, n := range balance {
+			if n != 0 {
+				t.Fatalf("run %d: %q has %d unbalanced activations", i, action, n)
+			}
+		}
+	}
+}
+
 func gotString(got []string) string {
 	return "got " + reflectStr(got)
 }

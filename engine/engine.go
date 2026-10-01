@@ -46,25 +46,27 @@ type engagement struct {
 type Engine struct {
 	cfg *config.Compiled
 
-	context  string
-	held     map[device.Key]struct{}
-	engaged  map[string]*engagement
-	owner    map[device.Key]string // key -> chord group currently claiming it
-	toggled  map[string]bool       // binding id -> switch state (per context)
-	active   map[string]bool       // binding id currently emitting Activate
-	switches []config.Binding      // context switches deferred from this edge
+	context   string
+	held      map[device.Key]struct{}
+	lingering map[device.Key]struct{} // physically down across a teardown; next release is stale
+	engaged   map[string]*engagement
+	owner     map[device.Key]string // key -> chord group currently claiming it
+	toggled   map[string]bool       // binding id -> switch state (per context)
+	active    map[string]bool       // binding id currently emitting Activate
+	switches  []config.Binding      // context switches deferred from this edge
 }
 
 // New builds an engine starting in the configured start context.
 func New(cfg *config.Compiled) *Engine {
 	return &Engine{
-		cfg:     cfg,
-		context: cfg.Start,
-		held:    make(map[device.Key]struct{}),
-		engaged: make(map[string]*engagement),
-		owner:   make(map[device.Key]string),
-		toggled: make(map[string]bool),
-		active:  make(map[string]bool),
+		cfg:       cfg,
+		context:   cfg.Start,
+		held:      make(map[device.Key]struct{}),
+		lingering: make(map[device.Key]struct{}),
+		engaged:   make(map[string]*engagement),
+		owner:     make(map[device.Key]string),
+		toggled:   make(map[string]bool),
+		active:    make(map[string]bool),
 	}
 }
 
@@ -129,17 +131,30 @@ func (e *Engine) Update(nowMs int64) []Event {
 }
 
 func (e *Engine) applyPhysical(key device.Key, phase device.Phase) []device.Edge {
-	_, isHeld := e.held[key]
-	switch {
-	case phase == device.Press && !isHeld:
+	switch phase {
+	case device.Press:
+		// A press always re-syncs a lingering key into the new round.
+		delete(e.lingering, key)
+		if _, isHeld := e.held[key]; isHeld {
+			return nil
+		}
 		e.held[key] = struct{}{}
 		return []device.Edge{{Key: key, Phase: device.Press}}
-	case phase == device.Release && isHeld:
+	case device.Release:
+		if _, stale := e.lingering[key]; stale {
+			// Continuation rule: a release left over from before a teardown
+			// (focus loss, device removal, context switch) must not cancel
+			// anything in the new round.
+			delete(e.lingering, key)
+			return nil
+		}
+		if _, isHeld := e.held[key]; !isHeld {
+			return nil
+		}
 		delete(e.held, key)
 		return []device.Edge{{Key: key, Phase: device.Release}}
-	default:
-		return nil
 	}
+	return nil
 }
 
 // reconcile recomputes chord ownership after an edge and diffs engagements.
@@ -282,30 +297,8 @@ func (e *Engine) endEngagement(g *engagement, keyReleased bool, nowMs int64) []E
 
 func (e *Engine) switchContext(sw config.Binding, nowMs int64) []Event {
 	from := e.context
-	var out []Event
-
-	ids := make([]string, 0, len(e.active))
-	for id := range e.active {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		for _, b := range e.cfg.Bindings(from) {
-			if b.ID == id {
-				out = append(out, Event{
-					Type: Deactivate, Action: b.Action, BindingID: b.ID, TimeMs: nowMs,
-				})
-			}
-		}
-	}
-
+	out := e.teardown(nowMs)
 	e.context = sw.TargetContext
-	e.held = make(map[device.Key]struct{})
-	e.engaged = make(map[string]*engagement)
-	e.owner = make(map[device.Key]string)
-	e.toggled = make(map[string]bool)
-	e.active = make(map[string]bool)
-
 	out = append(out, Event{
 		Type: ContextSwitched, BindingID: sw.ID,
 		FromContext: from, ToContext: sw.TargetContext, TimeMs: nowMs,
@@ -313,19 +306,53 @@ func (e *Engine) switchContext(sw config.Binding, nowMs int64) []Event {
 	return out
 }
 
-// Blur releases every logically held key, emitting the resulting deactivations.
-// Toggle state is preserved: it is a deliberate latch, not a physical hold.
-func (e *Engine) Blur(nowMs int64) []Event {
-	keys := make([]device.Key, 0, len(e.held))
-	for key := range e.held {
-		keys = append(keys, key)
+// teardown is the unified cleanup shared by focus loss, device removal and
+// context switches. Active continuous actions are deactivated and latched
+// switches are reset to off (each emitting exactly one Deactivate); pending
+// taps and long presses are cancelled silently. Keys still physically held
+// become lingering so their eventual releases are treated as stale input
+// from the previous round rather than cancelling new engagements.
+func (e *Engine) teardown(nowMs int64) []Event {
+	ids := make([]string, 0, len(e.active))
+	for id, on := range e.active {
+		if on {
+			ids = append(ids, id)
+		}
 	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	sort.Strings(ids)
 	var out []Event
-	for _, key := range keys {
-		out = append(out, e.ApplyRelease(key, nowMs)...)
+	for _, id := range ids {
+		for _, b := range e.cfg.Bindings(e.context) {
+			if b.ID == id {
+				out = append(out, Event{
+					Type: Deactivate, Action: b.Action, BindingID: b.ID, TimeMs: nowMs,
+				})
+			}
+		}
 	}
+	for key := range e.held {
+		e.lingering[key] = struct{}{}
+	}
+	e.held = make(map[device.Key]struct{})
+	e.engaged = make(map[string]*engagement)
+	e.owner = make(map[device.Key]string)
+	e.toggled = make(map[string]bool)
+	e.active = make(map[string]bool)
 	return out
+}
+
+// Blur handles input-focus loss with the unified teardown: held keys are
+// released and latched switches are turned off, so no action (including
+// toggles such as a flashlight) stays active after the window loses focus.
+func (e *Engine) Blur(nowMs int64) []Event {
+	return e.teardown(nowMs)
+}
+
+// DeviceRemoved handles the input device being unplugged or reset. It runs
+// the same unified teardown as Blur: continuous actions deactivate, latched
+// switches reset, and stale releases from the removed device are ignored.
+func (e *Engine) DeviceRemoved(nowMs int64) []Event {
+	return e.teardown(nowMs)
 }
 
 func chordGroup(chord []device.Key) string {
