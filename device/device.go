@@ -46,6 +46,15 @@ type Event struct {
 type Edge struct {
 	Key   Key
 	Phase Phase
+	// Epoch identifies the input generation the edge belongs to. Forced
+	// resets (focus loss, device removal, context switch) start a new
+	// epoch, so a stale physical release left over from before a reset can
+	// never release an action engaged by a later press.
+	Epoch int64
+	// Forced marks a synthetic edge produced by a reset rather than by a
+	// real message. Action layers use it only for bookkeeping: it must not
+	// fire taps or any other action (teardown is reported separately).
+	Forced bool
 }
 
 // FocusEvent reports input-focus changes from the host window.

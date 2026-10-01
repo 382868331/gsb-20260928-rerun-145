@@ -28,7 +28,18 @@ func replay(t *testing.T, cfg *config.Compiled, steps []step) []engine.Event {
 		last = s.t
 		edge, ok := kbd.Push(s.ev)
 		if ok {
-			out = append(out, eng.ApplyEdge(edge, s.t)...)
+			outs := eng.ApplyEdge(edge, s.t)
+			out = append(out, outs...)
+			for _, o := range outs {
+				// A context switch ends the input generation: the physical
+				// keyboard must be reset as well so stranded releases become
+				// stale instead of acting in the new context.
+				if o.Type == engine.ContextSwitched {
+					for _, forced := range kbd.Reset() {
+						eng.ApplyEdge(forced, s.t) // forced edges are no-ops
+					}
+				}
+			}
 		}
 	}
 	return out
@@ -144,7 +155,9 @@ func TestContextSwitchReleasesOldState(t *testing.T) {
 	}
 }
 
-// Losing input focus must not leave any action permanently held.
+// Losing input focus must not leave any action active: holds deactivate and
+// latched switches close and reset. A tap interrupted by blur never pulses,
+// and a stale physical release arriving afterwards is ignored.
 func TestBlurReleasesEverything(t *testing.T) {
 	cfg := compile(t, baseBindings())
 	kbd := device.NewVirtualKeyboard()
@@ -155,19 +168,67 @@ func TestBlurReleasesEverything(t *testing.T) {
 		}
 	}
 	feed(0, device.Event{Key: "Shift", Phase: device.Press})
+	feed(5, device.Event{Key: "L", Phase: device.Press})
+	feed(6, device.Event{Key: "L", Phase: device.Release}) // switch latched on
 	feed(10, device.Event{Key: "Ctrl", Phase: device.Press})
 	feed(20, device.Event{Key: "Q", Phase: device.Press})
-	if !eng.Active("run") || !eng.Active("quit") {
-		t.Fatal("expected run and quit active")
+	feed(25, device.Event{Key: "Space", Phase: device.Press}) // interrupted tap
+	if !eng.Active("run") || !eng.Active("quit") || !eng.Active("flashlight") {
+		t.Fatal("expected run, quit and flashlight active")
 	}
-	var out []engine.Event
+	out := eng.Blur(30)
 	for _, edge := range kbd.FocusChange(device.FocusEvent{Focused: false}) {
+		out = append(out, eng.ApplyEdge(edge, 30)...) // forced edges emit nothing
+	}
+	got := actions(out)
+	want := []string{"flashlight- ", "quit- ", "run- "}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf(gotString(got), want)
+	}
+	if eng.Active("run") || eng.Active("quit") || eng.Active("flashlight") {
+		t.Fatal("no action may remain active after blur")
+	}
+	// Stranded physical releases belong to the pre-blur epoch: ignored, and
+	// the interrupted Space tap never pulses.
+	feed(40, device.Event{Key: "Space", Phase: device.Release})
+	feed(41, device.Event{Key: "Shift", Phase: device.Release})
+	feed(42, device.Event{Key: "Q", Phase: device.Release})
+	feed(43, device.Event{Key: "Ctrl", Phase: device.Release})
+	// A fresh press after focus returns behaves normally exactly once.
+	feed(50, device.Event{Key: "Space", Phase: device.Press})
+	feed(60, device.Event{Key: "Space", Phase: device.Release})
+	// Switch starts from off after blur: one press cycle latches it on again.
+	feed(70, device.Event{Key: "L", Phase: device.Press})
+	feed(80, device.Event{Key: "L", Phase: device.Release})
+	if !eng.Active("flashlight") {
+		t.Fatal("switch should latch on again from a clean off state")
+	}
+}
+
+// Device removal follows the same contract as blur.
+func TestDeviceRemovedResetsActions(t *testing.T) {
+	cfg := compile(t, baseBindings())
+	kbd := device.NewVirtualKeyboard()
+	eng := engine.New(cfg)
+	feed := func(tt int64, ev device.Event) {
+		if edge, ok := kbd.Push(ev); ok {
+			eng.ApplyEdge(edge, tt)
+		}
+	}
+	feed(0, device.Event{Key: "Shift", Phase: device.Press})
+	feed(10, device.Event{Key: "L", Phase: device.Press})
+	feed(20, device.Event{Key: "L", Phase: device.Release})
+	out := eng.DeviceRemoved(30)
+	for _, edge := range kbd.Removed() {
 		out = append(out, eng.ApplyEdge(edge, 30)...)
 	}
 	got := actions(out)
-	want := []string{"quit- ", "run- "}
+	want := []string{"flashlight- ", "run- "}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf(gotString(got), want)
+	}
+	if eng.Active("run") || eng.Active("flashlight") {
+		t.Fatal("device removal must leave no active action")
 	}
 }
 
@@ -199,6 +260,103 @@ func TestSaveConfigDeterministicReplay(t *testing.T) {
 	want := []string{"jump!", "crouch!", "flashlight+ "}
 	if !reflect.DeepEqual(r1, want) {
 		t.Fatalf(gotString(r1), want)
+	}
+}
+
+// Mixed sequence: chords, holds, long press and a switch coexist; blur and
+// context switches run the unified teardown; stale releases from old input
+// generations are ignored. Saving the config as JSON and replaying must give
+// the exact same stream, with each release emitted once and no residual
+// active action except those deliberately latched by the new generation.
+func TestMixedTeardownAndReplayParity(t *testing.T) {
+	raw := config.Config{LongPressMs: 500, Bindings: baseBindings()}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loaded config.Config
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatal(err)
+	}
+	c1, _ := config.Compile(raw)
+	c2, _ := config.Compile(loaded)
+
+	run := func(cfg *config.Compiled) ([]string, *engine.Engine) {
+		kbd := device.NewVirtualKeyboard()
+		eng := engine.New(cfg)
+		var out []engine.Event
+		feed := func(tt int64, ev device.Event) {
+			out = append(out, eng.Update(tt)...)
+			if edge, ok := kbd.Push(ev); ok {
+				outs := eng.ApplyEdge(edge, tt)
+				out = append(out, outs...)
+				for _, o := range outs {
+					if o.Type == engine.ContextSwitched {
+						for _, forced := range kbd.Reset() {
+							eng.ApplyEdge(forced, tt)
+						}
+					}
+				}
+			}
+		}
+		press := func(tt int64, key device.Key) { feed(tt, device.Event{Key: key, Phase: device.Press}) }
+		release := func(tt int64, key device.Key) { feed(tt, device.Event{Key: key, Phase: device.Release}) }
+
+		press(0, "Shift") // run+
+		press(10, "L")
+		release(20, "L") // flashlight+
+		press(30, "Ctrl")
+		press(40, "Q") // quit+ chord
+		press(50, "C")
+		out = append(out, eng.Update(560)...) // crouch!
+
+		out = append(out, eng.Blur(570)...)
+		for _, forced := range kbd.FocusChange(device.FocusEvent{Focused: false}) {
+			out = append(out, eng.ApplyEdge(forced, 570)...)
+		}
+		release(580, "Q") // stale, ignored
+		release(581, "Ctrl")
+		release(582, "C")
+		release(583, "Shift")
+		release(584, "L")
+
+		press(600, "Space")
+		release(610, "Space") // jump! new generation
+
+		press(620, "Tab") // ctx default -> menu, keyboard reset
+		release(650, "Space")
+		release(651, "Tab") // stale releases ignored
+		press(660, "P")
+		release(670, "P") // pause!
+		press(700, "Tab") // ctx menu -> default
+
+		press(730, "L")
+		release(740, "L") // flashlight latches on from clean state
+		return actions(out), eng
+	}
+
+	r1, e1 := run(c1)
+	r2, e2 := run(c2)
+	want := []string{
+		"run+ ", "flashlight+ ", "quit+ ", "crouch!",
+		"flashlight- ", "quit- ", "run- ",
+		"jump!",
+		"ctx:default->menu", "pause!", "ctx:menu->default",
+		"flashlight+ ",
+	}
+	if !reflect.DeepEqual(r1, want) {
+		t.Fatalf("stream: %s", gotString(r1))
+	}
+	if !reflect.DeepEqual(r1, r2) {
+		t.Fatalf("saved-config replay differs: %v vs %v", r1, r2)
+	}
+	// Exactly one release per teardown, no residual holds; only the switch
+	// deliberately re-latched by the final generation stays active.
+	if e1.Active("run") || e1.Active("quit") || !e1.Active("flashlight") {
+		t.Fatal("unexpected residual active state after replay")
+	}
+	if e2.Active("run") || e2.Active("quit") || !e2.Active("flashlight") {
+		t.Fatal("saved-config replay leaves different active state")
 	}
 }
 

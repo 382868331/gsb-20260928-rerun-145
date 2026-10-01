@@ -46,25 +46,27 @@ type engagement struct {
 type Engine struct {
 	cfg *config.Compiled
 
-	context  string
-	held     map[device.Key]struct{}
-	engaged  map[string]*engagement
-	owner    map[device.Key]string // key -> chord group currently claiming it
-	toggled  map[string]bool       // binding id -> switch state (per context)
-	active   map[string]bool       // binding id currently emitting Activate
-	switches []config.Binding      // context switches deferred from this edge
+	context    string
+	held       map[device.Key]struct{}
+	pressEpoch map[device.Key]int64 // epoch of the press currently owning each logical key
+	engaged    map[string]*engagement
+	owner      map[device.Key]string // key -> chord group currently claiming it
+	toggled    map[string]bool       // binding id -> switch state (per context)
+	active     map[string]bool       // binding id currently emitting Activate
+	switches   []config.Binding      // context switches deferred from this edge
 }
 
 // New builds an engine starting in the configured start context.
 func New(cfg *config.Compiled) *Engine {
 	return &Engine{
-		cfg:     cfg,
-		context: cfg.Start,
-		held:    make(map[device.Key]struct{}),
-		engaged: make(map[string]*engagement),
-		owner:   make(map[device.Key]string),
-		toggled: make(map[string]bool),
-		active:  make(map[string]bool),
+		cfg:        cfg,
+		context:    cfg.Start,
+		held:       make(map[device.Key]struct{}),
+		pressEpoch: make(map[device.Key]int64),
+		engaged:    make(map[string]*engagement),
+		owner:      make(map[device.Key]string),
+		toggled:    make(map[string]bool),
+		active:     make(map[string]bool),
 	}
 }
 
@@ -88,19 +90,19 @@ func (e *Engine) Active(action string) bool {
 // Process handles one raw device event (duplicate edges are filtered by the
 // device layer, but the engine also ignores no-op repeats defensively).
 func (e *Engine) Process(ev device.Event, nowMs int64) []Event {
-	edges := e.applyPhysical(ev.Key, ev.Phase)
+	edges := e.applyEdge(device.Edge{Key: ev.Key, Phase: ev.Phase})
 	return e.reconcile(edges, nowMs)
 }
 
 // ApplyEdge handles one already-normalised edge.
 func (e *Engine) ApplyEdge(edge device.Edge, nowMs int64) []Event {
-	edges := e.applyPhysical(edge.Key, edge.Phase)
-	return e.reconcile(edges, nowMs)
-}
-
-// ApplyRelease injects a forced release for a key (used after focus loss).
-func (e *Engine) ApplyRelease(key device.Key, nowMs int64) []Event {
-	edges := e.applyPhysical(key, device.Release)
+	// Forced edges are the device layer's own teardown bookkeeping. Engine
+	// teardown (Blur/DeviceRemoved/context switch) reports action resets
+	// itself; these edges must never fire taps or flip switches a second time.
+	if edge.Forced {
+		return nil
+	}
+	edges := e.applyEdge(edge)
 	return e.reconcile(edges, nowMs)
 }
 
@@ -128,18 +130,26 @@ func (e *Engine) Update(nowMs int64) []Event {
 	return out
 }
 
-func (e *Engine) applyPhysical(key device.Key, phase device.Phase) []device.Edge {
-	_, isHeld := e.held[key]
-	switch {
-	case phase == device.Press && !isHeld:
+func (e *Engine) applyEdge(edge device.Edge) []device.Edge {
+	key, phase := edge.Key, edge.Phase
+	if phase == device.Press {
+		if _, isHeld := e.held[key]; isHeld {
+			return nil
+		}
 		e.held[key] = struct{}{}
+		e.pressEpoch[key] = edge.Epoch
 		return []device.Edge{{Key: key, Phase: device.Press}}
-	case phase == device.Release && isHeld:
-		delete(e.held, key)
-		return []device.Edge{{Key: key, Phase: device.Release}}
-	default:
+	}
+	// Only the press that started the current logical hold may release it. A
+	// release carrying an older epoch is a physical key-up stranded before a
+	// reset and must not affect actions of a newer press cycle.
+	pressedAt, known := e.pressEpoch[key]
+	if !known || pressedAt != edge.Epoch {
 		return nil
 	}
+	delete(e.held, key)
+	delete(e.pressEpoch, key)
+	return []device.Edge{{Key: key, Phase: device.Release}}
 }
 
 // reconcile recomputes chord ownership after an edge and diffs engagements.
@@ -282,30 +292,8 @@ func (e *Engine) endEngagement(g *engagement, keyReleased bool, nowMs int64) []E
 
 func (e *Engine) switchContext(sw config.Binding, nowMs int64) []Event {
 	from := e.context
-	var out []Event
-
-	ids := make([]string, 0, len(e.active))
-	for id := range e.active {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		for _, b := range e.cfg.Bindings(from) {
-			if b.ID == id {
-				out = append(out, Event{
-					Type: Deactivate, Action: b.Action, BindingID: b.ID, TimeMs: nowMs,
-				})
-			}
-		}
-	}
-
+	out := e.teardown(from, nowMs)
 	e.context = sw.TargetContext
-	e.held = make(map[device.Key]struct{})
-	e.engaged = make(map[string]*engagement)
-	e.owner = make(map[device.Key]string)
-	e.toggled = make(map[string]bool)
-	e.active = make(map[string]bool)
-
 	out = append(out, Event{
 		Type: ContextSwitched, BindingID: sw.ID,
 		FromContext: from, ToContext: sw.TargetContext, TimeMs: nowMs,
@@ -313,19 +301,59 @@ func (e *Engine) switchContext(sw config.Binding, nowMs int64) []Event {
 	return out
 }
 
-// Blur releases every logically held key, emitting the resulting deactivations.
-// Toggle state is preserved: it is a deliberate latch, not a physical hold.
-func (e *Engine) Blur(nowMs int64) []Event {
-	keys := make([]device.Key, 0, len(e.held))
-	for key := range e.held {
-		keys = append(keys, key)
+// teardown is the single reset path shared by focus loss, device removal and
+// context switches. It ends the current context according to each action's
+// contract:
+//   - active continuous actions (holds and latched-on switches) emit one
+//     Deactivate each, in binding-ID order, with no duplicate release;
+//   - switch latch state is cleared, so an enabled switch never survives a
+//     focus loss or device removal with its light still active;
+//   - in-flight taps and long presses are discarded without a Pulse (a reset
+//     is not a key release);
+//   - the logical key table and key-ownership bookkeeping are wiped, so stale
+//     physical releases from the old input generation cannot release actions
+//     of the next one.
+func (e *Engine) teardown(context string, nowMs int64) []Event {
+	ids := make([]string, 0, len(e.active))
+	for id, on := range e.active {
+		if on {
+			ids = append(ids, id)
+		}
 	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	sort.Strings(ids)
 	var out []Event
-	for _, key := range keys {
-		out = append(out, e.ApplyRelease(key, nowMs)...)
+	for _, id := range ids {
+		for _, b := range e.cfg.Bindings(context) {
+			if b.ID == id {
+				out = append(out, Event{
+					Type: Deactivate, Action: b.Action, BindingID: b.ID, TimeMs: nowMs,
+				})
+			}
+		}
 	}
+	e.held = make(map[device.Key]struct{})
+	e.pressEpoch = make(map[device.Key]int64)
+	e.engaged = make(map[string]*engagement)
+	e.owner = make(map[device.Key]string)
+	e.toggled = make(map[string]bool)
+	e.active = make(map[string]bool)
+	e.switches = nil
 	return out
+}
+
+// Blur handles focus loss for the current context: every continuous action
+// and latched switch is reset per teardown's contract. Pair it with the
+// device layer's FocusChange/Reset (the resulting forced edges are ignored by
+// ApplyEdge) so stale physical releases belong to the old input generation.
+func (e *Engine) Blur(nowMs int64) []Event {
+	return e.teardown(e.context, nowMs)
+}
+
+// DeviceRemoved handles unplugging the input device. Its contract is the same
+// as focus loss: holds deactivate, switches unlatch and close, pending taps
+// and long presses are abandoned, and the logical state starts clean.
+func (e *Engine) DeviceRemoved(nowMs int64) []Event {
+	return e.teardown(e.context, nowMs)
 }
 
 func chordGroup(chord []device.Key) string {
