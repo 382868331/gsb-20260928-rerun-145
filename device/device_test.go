@@ -8,14 +8,14 @@ import (
 )
 
 func TestDeduplicatesRepeatedMessages(t *testing.T) {
-	k := device.NewVirtualKeyboard()
+	k := device.NewVirtualKeyboard("")
 	presses := []device.Event{
 		{Seq: 1, Key: "A", Phase: device.Press},
 		{Seq: 2, Key: "A", Phase: device.Press},
 		{Seq: 3, Key: "A", Phase: device.Press},
 	}
 	edge, ok := k.Push(presses[0])
-	if !ok || edge != (device.Edge{Key: "A", Phase: device.Press}) {
+	if !ok || edge != (device.Edge{Device: device.DefaultDeviceID, Key: "A", Phase: device.Press}) {
 		t.Fatalf("first press should yield one edge, got %+v ok=%v", edge, ok)
 	}
 	for _, ev := range presses[1:] {
@@ -35,15 +35,15 @@ func TestDeduplicatesRepeatedMessages(t *testing.T) {
 }
 
 func TestBlurReleasesHeldKeysInOrder(t *testing.T) {
-	k := device.NewVirtualKeyboard()
+	k := device.NewVirtualKeyboard("kbd")
 	k.Push(device.Event{Seq: 1, Key: "Z", Phase: device.Press})
 	k.Push(device.Event{Seq: 2, Key: "A", Phase: device.Press})
 	k.Push(device.Event{Seq: 3, Key: "M", Phase: device.Press})
 	edges := k.FocusChange(device.FocusEvent{Focused: false})
 	want := []device.Edge{
-		{Key: "A", Phase: device.Release},
-		{Key: "M", Phase: device.Release},
-		{Key: "Z", Phase: device.Release},
+		{Device: "kbd", Key: "A", Phase: device.Release},
+		{Device: "kbd", Key: "M", Phase: device.Release},
+		{Device: "kbd", Key: "Z", Phase: device.Release},
 	}
 	if !reflect.DeepEqual(edges, want) {
 		t.Fatalf("got %v want %v", edges, want)
@@ -54,7 +54,7 @@ func TestBlurReleasesHeldKeysInOrder(t *testing.T) {
 }
 
 func TestRegainFocusEmitsNothing(t *testing.T) {
-	k := device.NewVirtualKeyboard()
+	k := device.NewVirtualKeyboard("")
 	k.Push(device.Event{Seq: 1, Key: "A", Phase: device.Press})
 	k.FocusChange(device.FocusEvent{Focused: false})
 	if edges := k.FocusChange(device.FocusEvent{Focused: true}); len(edges) != 0 {
