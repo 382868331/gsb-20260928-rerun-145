@@ -316,13 +316,13 @@ func TestMixedTeardownAndReplayConsistency(t *testing.T) {
 		release(100, "Q")
 		release(110, "Ctrl")
 		press(120, "L")
-		release(130, "L")                            // latch on again
-		out = append(out, eng.DeviceRemoved(140)...) // flashlight-, run-
-		release(150, "Shift")                        // stale release from the removed device
+		release(130, "L")                                                  // latch on again
+		out = append(out, eng.DeviceRemoved(device.DefaultSource, 140)...) // flashlight-, run-
+		release(150, "Shift")                                              // stale release from the removed device
 		press(160, "C")
 		out = append(out, eng.Update(700)...) // crouch! after 540ms
 		release(710, "C")
-		press(720, "Tab") // ctx default->menu
+		press(720, "Tab")   // ctx default->menu
 		release(725, "Tab") // stale release swallowed by the engine
 		press(730, "P")
 		release(740, "P")   // pause!

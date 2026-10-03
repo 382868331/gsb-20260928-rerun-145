@@ -9,12 +9,26 @@ package device
 // Blur forces every held key up via synthetic release edges, guaranteeing the
 // action layer cannot end up with keys stuck permanently after focus loss.
 type VirtualKeyboard struct {
-	down map[Key]struct{}
+	source Source
+	down   map[Key]struct{}
 }
 
-// NewVirtualKeyboard creates an empty virtual keyboard.
-func NewVirtualKeyboard() *VirtualKeyboard {
-	return &VirtualKeyboard{down: make(map[Key]struct{})}
+// NewVirtualKeyboard creates an empty virtual keyboard. An optional source
+// name tags every emitted edge so the engine can attribute input to this
+// device; with no argument the DefaultSource is used.
+func NewVirtualKeyboard(source ...Source) *VirtualKeyboard {
+	src := DefaultSource
+	if len(source) > 0 {
+		src = source[0]
+	}
+	return &VirtualKeyboard{source: src, down: make(map[Key]struct{})}
+}
+
+// Source reports the device name attached to emitted edges.
+func (k *VirtualKeyboard) Source() Source { return k.source }
+
+func (k *VirtualKeyboard) edge(key Key, phase Phase) Edge {
+	return Edge{Source: k.source, Key: key, Phase: phase}
 }
 
 // Push feeds one raw event and returns the edge it produced, if any.
@@ -24,10 +38,10 @@ func (k *VirtualKeyboard) Push(ev Event) (edge Edge, ok bool) {
 	switch {
 	case ev.Phase == Press && !held:
 		k.down[ev.Key] = struct{}{}
-		return Edge{Key: ev.Key, Phase: Press}, true
+		return k.edge(ev.Key, Press), true
 	case ev.Phase == Release && held:
 		delete(k.down, ev.Key)
-		return Edge{Key: ev.Key, Phase: Release}, true
+		return k.edge(ev.Key, Release), true
 	default:
 		return Edge{}, false
 	}
@@ -54,7 +68,7 @@ func (k *VirtualKeyboard) FocusChange(ev FocusEvent) []Edge {
 	edges := make([]Edge, 0, len(keys))
 	for _, key := range keys {
 		delete(k.down, key)
-		edges = append(edges, Edge{Key: key, Phase: Release})
+		edges = append(edges, k.edge(key, Release))
 	}
 	return edges
 }

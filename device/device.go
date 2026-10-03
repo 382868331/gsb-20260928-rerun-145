@@ -12,6 +12,13 @@ import "fmt"
 // Key is a physical/virtual key identifier, e.g. "A", "Space", "CtrlLeft".
 type Key string
 
+// Source identifies one input device feeding the engine, e.g. "kbd0" or
+// "pad1". The zero value (DefaultSource) is a valid single-device source.
+type Source string
+
+// DefaultSource is the implicit source used when a caller does not name one.
+const DefaultSource Source = ""
+
 // Phase describes a key edge or a focus change.
 type Phase int
 
@@ -36,16 +43,18 @@ func (p Phase) String() string {
 // Event is one raw message delivered to a virtual device.
 // Seq orders messages from one source; Down/Up share the same key space.
 type Event struct {
-	Seq   int64
-	Key   Key
-	Phase Phase
+	Seq    int64
+	Source Source
+	Key    Key
+	Phase  Phase
 }
 
 // Edge is a normalised transition emitted by a device.
 // Duplicate physical edges collapse to at most one Edge per state change.
 type Edge struct {
-	Key   Key
-	Phase Phase
+	Source Source
+	Key    Key
+	Phase  Phase
 }
 
 // FocusEvent reports input-focus changes from the host window.

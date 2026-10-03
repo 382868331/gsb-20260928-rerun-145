@@ -61,3 +61,18 @@ func TestRegainFocusEmitsNothing(t *testing.T) {
 		t.Fatalf("regaining focus emits no edges, got %v", edges)
 	}
 }
+
+func TestEdgesCarryDeviceSource(t *testing.T) {
+	k := device.NewVirtualKeyboard("pad1")
+	if k.Source() != "pad1" {
+		t.Fatalf("source = %q", k.Source())
+	}
+	edge, ok := k.Push(device.Event{Seq: 1, Key: "A", Phase: device.Press})
+	if !ok || edge.Source != "pad1" {
+		t.Fatalf("edge = %+v ok=%v, want source pad1", edge, ok)
+	}
+	edges := k.FocusChange(device.FocusEvent{Focused: false})
+	if len(edges) != 1 || edges[0].Source != "pad1" {
+		t.Fatalf("blur edges = %v, want one edge from pad1", edges)
+	}
+}
