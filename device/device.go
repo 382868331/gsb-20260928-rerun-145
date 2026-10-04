@@ -43,7 +43,12 @@ func (p Phase) String() string {
 // Event is one raw message delivered to a virtual device.
 // Seq orders messages from one source; Down/Up share the same key space.
 type Event struct {
-	Seq    int64
+	Seq int64
+	// Round identifies one physical press/release pair. A late release from
+	// an old press keeps the old round; a later press uses a new round. The
+	// caller should allocate a fresh non-zero round for every physical press
+	// and copy it onto that press's release message.
+	Round  uint64
 	Source Source
 	Key    Key
 	Phase  Phase
@@ -55,6 +60,7 @@ type Edge struct {
 	Source Source
 	Key    Key
 	Phase  Phase
+	Round  uint64
 }
 
 // FocusEvent reports input-focus changes from the host window.

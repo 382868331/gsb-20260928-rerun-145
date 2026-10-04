@@ -47,27 +47,27 @@ type Engine struct {
 	cfg *config.Compiled
 
 	context string
-	// held and lingering are tracked per input source so that several
-	// devices (keyboard + controller) can co-drive the same action and a
-	// stale release from one device never cancels another device's input.
-	held      map[device.Source]map[device.Key]struct{}
-	lingering map[device.Source]map[device.Key]struct{} // physically down across a teardown; next release is stale
-	engaged   map[string]*engagement
-	toggled   map[string]bool  // binding id -> switch state (per context)
-	active    map[string]bool  // binding id currently emitting Activate
-	switches  []config.Binding // context switches deferred from this edge
+	// held and pending are tracked per (input source, key, round). Several
+	// devices can co-drive the same action, and a release only removes the
+	// exact press round it names.
+	held     map[device.Source]map[device.Key]uint64
+	pending  map[device.Source]map[device.Key]uint64
+	engaged  map[string]*engagement
+	toggled  map[string]bool  // binding id -> switch state (per context)
+	active   map[string]bool  // binding id currently emitting Activate
+	switches []config.Binding // context switches deferred from this edge
 }
 
 // New builds an engine starting in the configured start context.
 func New(cfg *config.Compiled) *Engine {
 	return &Engine{
-		cfg:       cfg,
-		context:   cfg.Start,
-		held:      make(map[device.Source]map[device.Key]struct{}),
-		lingering: make(map[device.Source]map[device.Key]struct{}),
-		engaged:   make(map[string]*engagement),
-		toggled:   make(map[string]bool),
-		active:    make(map[string]bool),
+		cfg:     cfg,
+		context: cfg.Start,
+		held:    make(map[device.Source]map[device.Key]uint64),
+		pending: make(map[device.Source]map[device.Key]uint64),
+		engaged: make(map[string]*engagement),
+		toggled: make(map[string]bool),
+		active:  make(map[string]bool),
 	}
 }
 
@@ -88,22 +88,27 @@ func (e *Engine) Active(action string) bool {
 	return false
 }
 
-// Process handles one raw device event (duplicate edges are filtered by the
-// device layer, but the engine also ignores no-op repeats defensively).
+// Process handles one raw attributed device event. A new physical press must
+// carry a fresh, non-zero Round which its release repeats; this is what lets
+// an out-of-order old release be distinguished from the new press's release.
+// Duplicate edges are filtered by the device layer, but the engine also
+// ignores no-op repeats defensively.
 func (e *Engine) Process(ev device.Event, nowMs int64) []Event {
-	edge := e.applyPhysical(ev.Source, ev.Key, ev.Phase)
+	edge := e.applyPhysicalEdge(device.Edge{Source: ev.Source, Key: ev.Key, Phase: ev.Phase, Round: ev.Round})
 	return e.reconcile(edge, nowMs)
 }
 
 // ApplyEdge handles one already-normalised edge.
 func (e *Engine) ApplyEdge(edge device.Edge, nowMs int64) []Event {
-	return e.reconcile(e.applyPhysical(edge.Source, edge.Key, edge.Phase), nowMs)
+	return e.reconcile(e.applyPhysicalEdge(edge), nowMs)
 }
 
 // ApplyRelease injects a forced release for a key on one source (used after
 // focus loss).
 func (e *Engine) ApplyRelease(source device.Source, key device.Key, nowMs int64) []Event {
-	return e.reconcile(e.applyPhysical(source, key, device.Release), nowMs)
+	round := e.held[source][key]
+	delete(e.held[source], key)
+	return e.reconcile(&device.Edge{Source: source, Key: key, Phase: device.Release, Round: round}, nowMs)
 }
 
 // Update expires long-press timers. Call it with the replay's current time.
@@ -130,49 +135,53 @@ func (e *Engine) Update(nowMs int64) []Event {
 	return out
 }
 
-// applyPhysical folds one raw transition into the per-source state and
-// returns the resulting edge, or nil when the message is a no-op or a stale
-// leftover from a previous round.
-func (e *Engine) applyPhysical(source device.Source, key device.Key, phase device.Phase) *device.Edge {
+func (e *Engine) applyPhysicalEdge(in device.Edge) *device.Edge {
+	source, key, phase, round := in.Source, in.Key, in.Phase, in.Round
 	switch phase {
 	case device.Press:
-		// A press always re-syncs a lingering key on this source into the
-		// new round.
-		if set, ok := e.lingering[source]; ok {
-			delete(set, key)
-		}
-		if _, isHeld := e.sourceHeld(source)[key]; isHeld {
+		// Any press re-confirms the physical key. If an old message is still
+		// queued, it has a different (explicit) round and therefore can never
+		// close this new holder.
+		delete(e.sourcePending(source), key)
+		if current, isHeld := e.sourceHeld(source)[key]; isHeld && current == round {
 			return nil
 		}
-		e.sourceHeld(source)[key] = struct{}{}
-		edge := device.Edge{Source: source, Key: key, Phase: device.Press}
+		e.sourceHeld(source)[key] = round
+		edge := device.Edge{Source: source, Key: key, Phase: device.Press, Round: round}
 		return &edge
 	case device.Release:
-		if set, stale := e.lingering[source]; stale {
-			// Continuation rule: a release left over from before a teardown
-			// (focus loss, device removal, context switch) must not cancel
-			// anything in the new round. Attribution is per (source, key):
-			// the stale release only cancels the input it belongs to.
-			if _, ok := set[key]; ok {
-				delete(set, key)
-				return nil
+		current, isHeld := e.held[source][key]
+		pendingRound, hasPending := e.pending[source][key]
+		matchesCurrent := isHeld && (current == round || (round == 0 && current == 0 && (!hasPending || pendingRound == 0)))
+		if !matchesCurrent {
+			if set := e.pending[source]; set != nil {
+				if oldRound, ok := set[key]; ok && (oldRound == round || round == 0) {
+					delete(set, key)
+				}
 			}
-		}
-		if _, isHeld := e.held[source][key]; !isHeld {
 			return nil
 		}
 		delete(e.held[source], key)
-		edge := device.Edge{Source: source, Key: key, Phase: device.Release}
+		edge := device.Edge{Source: source, Key: key, Phase: device.Release, Round: round}
 		return &edge
 	}
 	return nil
 }
 
-func (e *Engine) sourceHeld(source device.Source) map[device.Key]struct{} {
+func (e *Engine) sourceHeld(source device.Source) map[device.Key]uint64 {
 	set, ok := e.held[source]
 	if !ok {
-		set = make(map[device.Key]struct{})
+		set = make(map[device.Key]uint64)
 		e.held[source] = set
+	}
+	return set
+}
+
+func (e *Engine) sourcePending(source device.Source) map[device.Key]uint64 {
+	set, ok := e.pending[source]
+	if !ok {
+		set = make(map[device.Key]uint64)
+		e.pending[source] = set
 	}
 	return set
 }
@@ -346,17 +355,17 @@ func (e *Engine) switchContext(sw config.Binding, nowMs int64) []Event {
 // teardown is the unified cleanup shared by focus loss and context switches.
 // Active continuous actions are deactivated and latched switches are reset
 // to off (each emitting exactly one Deactivate); pending taps and long
-// presses are cancelled silently. Keys still physically held become
-// lingering per source so their eventual releases are treated as stale
-// input from the previous round rather than cancelling new engagements.
+// presses are cancelled silently. Keys still physically held retain their
+// original rounds as unconfirmed holders: only the matching old release can
+// consume that record, and it can never remove a newer holder.
 func (e *Engine) teardown(nowMs int64) []Event {
 	out := e.deactivateAll(nowMs)
 	for source, set := range e.held {
-		for key := range set {
-			e.markLingering(source, key)
+		for key, round := range set {
+			e.markPending(source, key, round)
 		}
 	}
-	e.held = make(map[device.Source]map[device.Key]struct{})
+	e.held = make(map[device.Source]map[device.Key]uint64)
 	e.engaged = make(map[string]*engagement)
 	e.toggled = make(map[string]bool)
 	e.active = make(map[string]bool)
@@ -385,13 +394,13 @@ func (e *Engine) deactivateAll(nowMs int64) []Event {
 	return out
 }
 
-func (e *Engine) markLingering(source device.Source, key device.Key) {
-	set, ok := e.lingering[source]
+func (e *Engine) markPending(source device.Source, key device.Key, round uint64) {
+	set, ok := e.pending[source]
 	if !ok {
-		set = make(map[device.Key]struct{})
-		e.lingering[source] = set
+		set = make(map[device.Key]uint64)
+		e.pending[source] = set
 	}
-	set[key] = struct{}{}
+	set[key] = round
 }
 
 // Blur handles input-focus loss with the unified teardown: held keys are
@@ -402,9 +411,9 @@ func (e *Engine) Blur(nowMs int64) []Event {
 }
 
 // DeviceRemoved handles one input device being unplugged or reset. The
-// cleanup is scoped to that source: keys it still held become lingering (so
-// late releases arriving after removal or after a reconnect are swallowed
-// instead of cancelling the new round), latched switches reset to off, and
+// cleanup is scoped to that source: keys it still held retain their old round
+// as unconfirmed input (so late releases arriving after removal or reconnect
+// consume only that old round), latched switches reset to off, and
 // continuous actions end only when no other connected device still
 // satisfies their chord. State held by other sources is untouched, so a
 // reconnected device starts from a clean slate and never inherits the old
@@ -431,8 +440,8 @@ func (e *Engine) DeviceRemoved(source device.Source, nowMs int64) []Event {
 		delete(e.toggled, id)
 		delete(e.active, id)
 	}
-	for key := range e.held[source] {
-		e.markLingering(source, key)
+	for key, round := range e.held[source] {
+		e.markPending(source, key, round)
 	}
 	delete(e.held, source)
 	out = append(out, e.reconcile(nil, nowMs)...)
@@ -463,6 +472,7 @@ func containsKey(chord []device.Key, key device.Key) bool {
 type InputRef struct {
 	Source device.Source `json:"source"`
 	Key    device.Key    `json:"key"`
+	Round  uint64        `json:"round,omitempty"`
 }
 
 // Snapshot is the persistable, JSON-serialisable part of the engine state:
@@ -471,9 +481,11 @@ type InputRef struct {
 type Snapshot struct {
 	// Context is the active context at save time.
 	Context string `json:"context"`
-	// Held lists inputs physically down at save time, sorted.
+	// Held lists current holders at save time, sorted.
 	Held []InputRef `json:"held,omitempty"`
-	// Lingering lists inputs whose releases are already known to be stale.
+	// Pending lists old-round holders awaiting one matching stale release.
+	Pending []InputRef `json:"pending,omitempty"`
+	// Lingering is retained for old snapshots that did not carry rounds.
 	Lingering []InputRef `json:"lingering,omitempty"`
 	// Toggled lists binding ids whose switch is latched on, sorted.
 	Toggled []string `json:"toggled,omitempty"`
@@ -485,7 +497,7 @@ type Snapshot struct {
 func (e *Engine) Snapshot() Snapshot {
 	snap := Snapshot{Context: e.context}
 	snap.Held = flattenRefs(e.held)
-	snap.Lingering = flattenRefs(e.lingering)
+	snap.Pending = flattenRefs(e.pending)
 	for id, on := range e.toggled {
 		if on {
 			snap.Toggled = append(snap.Toggled, id)
@@ -497,26 +509,29 @@ func (e *Engine) Snapshot() Snapshot {
 
 // Restore rebuilds a saved state into the engine, replacing whatever was
 // there. Previously held inputs are treated as unconfirmed: they join the
-// lingering set, so a leftover release from before the reload is swallowed
-// and only a fresh press re-syncs them into a new round. Latched switches
-// are turned back on, emitting exactly one Activate each (sorted by binding
-// id) so the game can re-enable them.
+// pending set, so a leftover release consumes only the saved old round and
+// only a fresh press re-syncs them into a new round. Latched switches are
+// turned back on, emitting exactly one Activate each (sorted by binding id)
+// so the game can re-enable them.
 func (e *Engine) Restore(snap Snapshot, nowMs int64) []Event {
 	e.context = snap.Context
 	if e.context == "" {
 		e.context = e.cfg.Start
 	}
-	e.held = make(map[device.Source]map[device.Key]struct{})
-	e.lingering = make(map[device.Source]map[device.Key]struct{})
+	e.held = make(map[device.Source]map[device.Key]uint64)
+	e.pending = make(map[device.Source]map[device.Key]uint64)
 	e.engaged = make(map[string]*engagement)
 	e.toggled = make(map[string]bool)
 	e.active = make(map[string]bool)
 	e.switches = nil
 	for _, ref := range snap.Held {
-		e.markLingering(ref.Source, ref.Key)
+		e.markPending(ref.Source, ref.Key, ref.Round)
+	}
+	for _, ref := range snap.Pending {
+		e.markPending(ref.Source, ref.Key, ref.Round)
 	}
 	for _, ref := range snap.Lingering {
-		e.markLingering(ref.Source, ref.Key)
+		e.markPending(ref.Source, ref.Key, ref.Round)
 	}
 	var out []Event
 	for _, id := range snap.Toggled {
@@ -533,19 +548,23 @@ func (e *Engine) Restore(snap Snapshot, nowMs int64) []Event {
 	return out
 }
 
-// PendingReconfirm lists every input whose physical state is unconfirmed:
-// keys in the lingering set, sorted by source then key. After a Restore this
-// is exactly the set of inputs the caller must re-confirm (a fresh press)
-// before they can drive actions again; their stale releases are ignored.
+// PendingReconfirm lists every input whose physical state is unconfirmed,
+// including its old press round, sorted by source then key. After a Restore
+// this is exactly the set of inputs the caller must re-confirm with a fresh
+// press before they can drive actions again; matching stale releases only
+// remove the old-round pending record.
 func (e *Engine) PendingReconfirm() []InputRef {
-	return flattenRefs(e.lingering)
+	return flattenRefs(e.pending)
 }
 
-func flattenRefs(sets map[device.Source]map[device.Key]struct{}) []InputRef {
+// Holders lists every currently confirmed input, including its press round.
+func (e *Engine) Holders() []InputRef { return flattenRefs(e.held) }
+
+func flattenRefs(sets map[device.Source]map[device.Key]uint64) []InputRef {
 	var out []InputRef
 	for source, set := range sets {
-		for key := range set {
-			out = append(out, InputRef{Source: source, Key: key})
+		for key, round := range set {
+			out = append(out, InputRef{Source: source, Key: key, Round: round})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {

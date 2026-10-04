@@ -10,7 +10,7 @@ package device
 // action layer cannot end up with keys stuck permanently after focus loss.
 type VirtualKeyboard struct {
 	source Source
-	down   map[Key]struct{}
+	down   map[Key]uint64
 }
 
 // NewVirtualKeyboard creates an empty virtual keyboard. An optional source
@@ -21,7 +21,7 @@ func NewVirtualKeyboard(source ...Source) *VirtualKeyboard {
 	if len(source) > 0 {
 		src = source[0]
 	}
-	return &VirtualKeyboard{source: src, down: make(map[Key]struct{})}
+	return &VirtualKeyboard{source: src, down: make(map[Key]uint64)}
 }
 
 // Source reports the device name attached to emitted edges.
@@ -34,14 +34,16 @@ func (k *VirtualKeyboard) edge(key Key, phase Phase) Edge {
 // Push feeds one raw event and returns the edge it produced, if any.
 // A repeated message that does not change key state yields no edge and ok=false.
 func (k *VirtualKeyboard) Push(ev Event) (edge Edge, ok bool) {
-	_, held := k.down[ev.Key]
+	round, held := k.down[ev.Key]
 	switch {
-	case ev.Phase == Press && !held:
-		k.down[ev.Key] = struct{}{}
-		return k.edge(ev.Key, Press), true
-	case ev.Phase == Release && held:
+	case ev.Phase == Press && (!held || round != ev.Round):
+		k.down[ev.Key] = ev.Round
+		return Edge{Source: k.source, Key: ev.Key, Phase: Press, Round: ev.Round}, true
+	case ev.Phase == Release && held && round == ev.Round:
 		delete(k.down, ev.Key)
-		return k.edge(ev.Key, Release), true
+		return Edge{Source: k.source, Key: ev.Key, Phase: Release, Round: ev.Round}, true
+	case ev.Phase == Release && held && round != ev.Round:
+		return Edge{Source: k.source, Key: ev.Key, Phase: Release, Round: ev.Round}, true
 	default:
 		return Edge{}, false
 	}
@@ -67,8 +69,9 @@ func (k *VirtualKeyboard) FocusChange(ev FocusEvent) []Edge {
 	sortKeys(keys)
 	edges := make([]Edge, 0, len(keys))
 	for _, key := range keys {
+		round := k.down[key]
 		delete(k.down, key)
-		edges = append(edges, k.edge(key, Release))
+		edges = append(edges, Edge{Source: k.source, Key: key, Phase: Release, Round: round})
 	}
 	return edges
 }
