@@ -42,6 +42,15 @@ type engagement struct {
 	longFired bool
 }
 
+// holder records one live hold: which input round currently owns a
+// physically held (source, key). Every press mints a fresh round and every
+// release names the round it closes, so a late or duplicated release from a
+// previous round can be checked against the holder and rejected instead of
+// cancelling a newer round on the same device.
+type holder struct {
+	round int64
+}
+
 // Engine maps keyboard edges to actions for one configuration.
 type Engine struct {
 	cfg *config.Compiled
@@ -50,8 +59,9 @@ type Engine struct {
 	// held and lingering are tracked per input source so that several
 	// devices (keyboard + controller) can co-drive the same action and a
 	// stale release from one device never cancels another device's input.
-	held      map[device.Source]map[device.Key]struct{}
-	lingering map[device.Source]map[device.Key]struct{} // physically down across a teardown; next release is stale
+	held      map[device.Source]map[device.Key]holder
+	lingering map[device.Source]map[device.Key]int64 // (source,key) -> last observed stale round
+	roundMax  map[device.Source]int64               // high-water round per source
 	engaged   map[string]*engagement
 	toggled   map[string]bool  // binding id -> switch state (per context)
 	active    map[string]bool  // binding id currently emitting Activate
@@ -63,8 +73,9 @@ func New(cfg *config.Compiled) *Engine {
 	return &Engine{
 		cfg:       cfg,
 		context:   cfg.Start,
-		held:      make(map[device.Source]map[device.Key]struct{}),
-		lingering: make(map[device.Source]map[device.Key]struct{}),
+		held:      make(map[device.Source]map[device.Key]holder),
+		lingering: make(map[device.Source]map[device.Key]int64),
+		roundMax:  make(map[device.Source]int64),
 		engaged:   make(map[string]*engagement),
 		toggled:   make(map[string]bool),
 		active:    make(map[string]bool),
@@ -91,19 +102,25 @@ func (e *Engine) Active(action string) bool {
 // Process handles one raw device event (duplicate edges are filtered by the
 // device layer, but the engine also ignores no-op repeats defensively).
 func (e *Engine) Process(ev device.Event, nowMs int64) []Event {
-	edge := e.applyPhysical(ev.Source, ev.Key, ev.Phase)
+	edge := e.applyPhysical(ev.Source, ev.Key, ev.Phase, ev.Round)
 	return e.reconcile(edge, nowMs)
 }
 
 // ApplyEdge handles one already-normalised edge.
 func (e *Engine) ApplyEdge(edge device.Edge, nowMs int64) []Event {
-	return e.reconcile(e.applyPhysical(edge.Source, edge.Key, edge.Phase), nowMs)
+	return e.reconcile(e.applyPhysical(edge.Source, edge.Key, edge.Phase, edge.Round), nowMs)
 }
 
 // ApplyRelease injects a forced release for a key on one source (used after
 // focus loss).
 func (e *Engine) ApplyRelease(source device.Source, key device.Key, nowMs int64) []Event {
-	return e.reconcile(e.applyPhysical(source, key, device.Release), nowMs)
+	round := int64(0)
+	if set, ok := e.held[source]; ok {
+		if h, ok := set[key]; ok {
+			round = h.round
+		}
+	}
+	return e.reconcile(e.applyPhysical(source, key, device.Release, round), nowMs)
 }
 
 // Update expires long-press timers. Call it with the replay's current time.
@@ -133,46 +150,69 @@ func (e *Engine) Update(nowMs int64) []Event {
 // applyPhysical folds one raw transition into the per-source state and
 // returns the resulting edge, or nil when the message is a no-op or a stale
 // leftover from a previous round.
-func (e *Engine) applyPhysical(source device.Source, key device.Key, phase device.Phase) *device.Edge {
+func (e *Engine) applyPhysical(source device.Source, key device.Key, phase device.Phase, round int64) *device.Edge {
 	switch phase {
 	case device.Press:
-		// A press always re-syncs a lingering key on this source into the
-		// new round.
-		if set, ok := e.lingering[source]; ok {
-			delete(set, key)
-		}
-		if _, isHeld := e.sourceHeld(source)[key]; isHeld {
+		// A press with no explicit round (legacy traffic) mints a round
+		// locally; explicit rounds are the device-authoritative ids.
+		heldSet := e.sourceHeld(source)
+		if _, isHeld := heldSet[key]; isHeld {
 			return nil
 		}
-		e.sourceHeld(source)[key] = struct{}{}
-		edge := device.Edge{Source: source, Key: key, Phase: device.Press}
+		if round == 0 {
+			round = e.nextRound(source)
+		}
+		if round > e.roundMax[source] {
+			e.roundMax[source] = round
+		}
+		heldSet[key] = holder{round: round}
+		delete(e.sourceLingering(source), key)
+		edge := device.Edge{Source: source, Key: key, Phase: device.Press, Round: round}
 		return &edge
 	case device.Release:
-		if set, stale := e.lingering[source]; stale {
-			// Continuation rule: a release left over from before a teardown
-			// (focus loss, device removal, context switch) must not cancel
-			// anything in the new round. Attribution is per (source, key):
-			// the stale release only cancels the input it belongs to.
-			if _, ok := set[key]; ok {
-				delete(set, key)
-				return nil
-			}
-		}
-		if _, isHeld := e.held[source][key]; !isHeld {
+		heldSet := e.held[source]
+		h, isHeld := heldSet[key]
+		if !isHeld {
+			// No live round for this input: remember the round the message
+			// belonged to so a duplicated stale release is recognisable, but
+			// it can never cancel a round that does not exist yet.
+			e.sourceLingering(source)[key] = round
 			return nil
 		}
-		delete(e.held[source], key)
-		edge := device.Edge{Source: source, Key: key, Phase: device.Release}
+		if round != 0 && round != h.round {
+			// Provably belongs to an older (or unknown) round than the one
+			// currently held. Record it and leave the newer hold untouched:
+			// this is the "new press arrived first, old release later" case.
+			e.sourceLingering(source)[key] = round
+			return nil
+		}
+		delete(heldSet, key)
+		edge := device.Edge{Source: source, Key: key, Phase: device.Release, Round: h.round}
 		return &edge
 	}
 	return nil
 }
 
-func (e *Engine) sourceHeld(source device.Source) map[device.Key]struct{} {
+func (e *Engine) sourceHeld(source device.Source) map[device.Key]holder {
 	set, ok := e.held[source]
 	if !ok {
-		set = make(map[device.Key]struct{})
+		set = make(map[device.Key]holder)
 		e.held[source] = set
+	}
+	return set
+}
+
+// nextRound mints an engine-local round for an unattributed press. It stays
+// strictly above every round ever seen on this source (including across a
+// Restore), so it can never collide with a release carried over from an
+// earlier incarnation.
+func (e *Engine) nextRound(source device.Source) int64 { return e.roundMax[source] + 1 }
+
+func (e *Engine) sourceLingering(source device.Source) map[device.Key]int64 {
+	set, ok := e.lingering[source]
+	if !ok {
+		set = make(map[device.Key]int64)
+		e.lingering[source] = set
 	}
 	return set
 }
@@ -352,11 +392,11 @@ func (e *Engine) switchContext(sw config.Binding, nowMs int64) []Event {
 func (e *Engine) teardown(nowMs int64) []Event {
 	out := e.deactivateAll(nowMs)
 	for source, set := range e.held {
-		for key := range set {
-			e.markLingering(source, key)
+		for key, h := range set {
+			e.markLingering(source, key, h.round)
 		}
 	}
-	e.held = make(map[device.Source]map[device.Key]struct{})
+	e.held = make(map[device.Source]map[device.Key]holder)
 	e.engaged = make(map[string]*engagement)
 	e.toggled = make(map[string]bool)
 	e.active = make(map[string]bool)
@@ -385,13 +425,34 @@ func (e *Engine) deactivateAll(nowMs int64) []Event {
 	return out
 }
 
-func (e *Engine) markLingering(source device.Source, key device.Key) {
+func (e *Engine) markLingering(source device.Source, key device.Key, round int64) {
 	set, ok := e.lingering[source]
 	if !ok {
-		set = make(map[device.Key]struct{})
+		set = make(map[device.Key]int64)
 		e.lingering[source] = set
 	}
-	set[key] = struct{}{}
+	if round > set[key] {
+		set[key] = round
+	}
+}
+
+// Holders reports every input currently considered live, with the round that
+// owns it, sorted by source then key. Use it to audit which devices keep an
+// action active and which round each press/release belongs to.
+func (e *Engine) Holders() []HeldRef {
+	var out []HeldRef
+	for source, set := range e.held {
+		for key, h := range set {
+			out = append(out, HeldRef{Source: source, Key: key, Round: h.round})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Source != out[j].Source {
+			return out[i].Source < out[j].Source
+		}
+		return out[i].Key < out[j].Key
+	})
+	return out
 }
 
 // Blur handles input-focus loss with the unified teardown: held keys are
@@ -431,10 +492,10 @@ func (e *Engine) DeviceRemoved(source device.Source, nowMs int64) []Event {
 		delete(e.toggled, id)
 		delete(e.active, id)
 	}
-	for key := range e.held[source] {
-		e.markLingering(source, key)
+	for key, h := range e.held[source] {
+		e.markLingering(source, key, h.round)
 	}
-	delete(e.held, source)
+	e.held[source] = make(map[device.Key]holder)
 	out = append(out, e.reconcile(nil, nowMs)...)
 	return out
 }

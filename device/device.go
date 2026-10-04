@@ -47,6 +47,14 @@ type Event struct {
 	Source Source
 	Key    Key
 	Phase  Phase
+	// Round tags a raw message with the input round it belongs to, mirroring
+	// Edge.Round. A press with Round 0 asks the device to mint a new round;
+	// a release with Round 0 closes whatever round the device currently
+	// considers live (legacy, in-order traffic). A release carrying a
+	// non-zero round is forwarded verbatim even if the device already moved
+	// on to a newer round, so a late release can be attributed instead of
+	// being confused with the next round.
+	Round int64
 }
 
 // Edge is a normalised transition emitted by a device.
@@ -55,6 +63,12 @@ type Edge struct {
 	Source Source
 	Key    Key
 	Phase  Phase
+	// Round identifies the input round this edge belongs to. Every press
+	// that starts a new down-stretch gets a fresh, monotonically increasing
+	// round on that device; the matching release carries the same round.
+	// A release whose round no longer matches the live round is provably a
+	// stale or duplicated message from an earlier round.
+	Round int64
 }
 
 // FocusEvent reports input-focus changes from the host window.

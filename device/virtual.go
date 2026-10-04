@@ -10,7 +10,8 @@ package device
 // action layer cannot end up with keys stuck permanently after focus loss.
 type VirtualKeyboard struct {
 	source Source
-	down   map[Key]struct{}
+	down   map[Key]int64 // key -> live round currently down
+	round  int64         // latest round handed out on this device
 }
 
 // NewVirtualKeyboard creates an empty virtual keyboard. An optional source
@@ -21,27 +22,58 @@ func NewVirtualKeyboard(source ...Source) *VirtualKeyboard {
 	if len(source) > 0 {
 		src = source[0]
 	}
-	return &VirtualKeyboard{source: src, down: make(map[Key]struct{})}
+	return &VirtualKeyboard{source: src, down: make(map[Key]int64)}
 }
+
+// NewVirtualKeyboardFromRound creates a device whose next minted round is
+// round+1. Pass a persistent per-device counter across a reconnect so that
+// rounds from the device's previous incarnation can never collide with the
+// new one.
+func NewVirtualKeyboardFromRound(source Source, round int64) *VirtualKeyboard {
+	return &VirtualKeyboard{source: source, down: make(map[Key]int64), round: round}
+}
+
+// Round reports the latest round minted on this device (0 before any press).
+func (k *VirtualKeyboard) Round() int64 { return k.round }
 
 // Source reports the device name attached to emitted edges.
 func (k *VirtualKeyboard) Source() Source { return k.source }
 
-func (k *VirtualKeyboard) edge(key Key, phase Phase) Edge {
-	return Edge{Source: k.source, Key: key, Phase: phase}
+func (k *VirtualKeyboard) edge(key Key, phase Phase, round int64) Edge {
+	return Edge{Source: k.source, Key: key, Phase: phase, Round: round}
 }
 
 // Push feeds one raw event and returns the edge it produced, if any.
 // A repeated message that does not change key state yields no edge and ok=false.
 func (k *VirtualKeyboard) Push(ev Event) (edge Edge, ok bool) {
-	_, held := k.down[ev.Key]
+	oldRound, held := k.down[ev.Key]
 	switch {
 	case ev.Phase == Press && !held:
-		k.down[ev.Key] = struct{}{}
-		return k.edge(ev.Key, Press), true
-	case ev.Phase == Release && held:
-		delete(k.down, ev.Key)
-		return k.edge(ev.Key, Release), true
+		round := ev.Round
+		if round <= k.round {
+			k.round++
+			round = k.round
+		}
+		k.round = round
+		k.down[ev.Key] = round
+		return k.edge(ev.Key, Press, round), true
+	case ev.Phase == Release:
+		round := ev.Round
+		if round == 0 {
+			if !held {
+				return Edge{}, false
+			}
+			round = oldRound
+		}
+		// A release that names the live round closes it. A release naming an
+		// older round (arriving after a newer press, after blur+repress, or
+		// duplicated) is still emitted with its own round so the action layer
+		// can attribute and ignore it; swallowing it here would make the next
+		// in-order release look stale and could wedge an action on.
+		if held && round == oldRound {
+			delete(k.down, ev.Key)
+		}
+		return k.edge(ev.Key, Release, round), true
 	default:
 		return Edge{}, false
 	}
@@ -67,8 +99,9 @@ func (k *VirtualKeyboard) FocusChange(ev FocusEvent) []Edge {
 	sortKeys(keys)
 	edges := make([]Edge, 0, len(keys))
 	for _, key := range keys {
+		round := k.down[key]
 		delete(k.down, key)
-		edges = append(edges, k.edge(key, Release))
+		edges = append(edges, k.edge(key, Release, round))
 	}
 	return edges
 }
