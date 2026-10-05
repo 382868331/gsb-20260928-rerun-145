@@ -51,6 +51,18 @@ type holder struct {
 	round int64
 }
 
+// HeldRef identifies a physical input on one device and the input round that
+// currently owns it.
+type HeldRef struct {
+	Source device.Source `json:"source"`
+	Key    device.Key    `json:"key"`
+	Round  int64         `json:"round"`
+}
+
+// InputRef is retained as the exported name for a sourced input reference.
+// New code should use HeldRef when round attribution matters.
+type InputRef = HeldRef
+
 // Engine maps keyboard edges to actions for one configuration.
 type Engine struct {
 	cfg *config.Compiled
@@ -61,7 +73,7 @@ type Engine struct {
 	// stale release from one device never cancels another device's input.
 	held      map[device.Source]map[device.Key]holder
 	lingering map[device.Source]map[device.Key]int64 // (source,key) -> last observed stale round
-	roundMax  map[device.Source]int64               // high-water round per source
+	roundMax  map[device.Source]int64                // high-water round per source
 	engaged   map[string]*engagement
 	toggled   map[string]bool  // binding id -> switch state (per context)
 	active    map[string]bool  // binding id currently emitting Activate
@@ -161,6 +173,8 @@ func (e *Engine) applyPhysical(source device.Source, key device.Key, phase devic
 		}
 		if round == 0 {
 			round = e.nextRound(source)
+		} else if round <= e.roundMax[source] {
+			return nil
 		}
 		if round > e.roundMax[source] {
 			e.roundMax[source] = round
@@ -173,17 +187,17 @@ func (e *Engine) applyPhysical(source device.Source, key device.Key, phase devic
 		heldSet := e.held[source]
 		h, isHeld := heldSet[key]
 		if !isHeld {
-			// No live round for this input: remember the round the message
-			// belonged to so a duplicated stale release is recognisable, but
-			// it can never cancel a round that does not exist yet.
-			e.sourceLingering(source)[key] = round
+			staleSet := e.lingering[source]
+			pending, waiting := staleSet[key]
+			if waiting && (round == 0 || round == pending) {
+				delete(staleSet, key)
+			}
 			return nil
 		}
 		if round != 0 && round != h.round {
-			// Provably belongs to an older (or unknown) round than the one
-			// currently held. Record it and leave the newer hold untouched:
-			// this is the "new press arrived first, old release later" case.
-			e.sourceLingering(source)[key] = round
+			if pending, waiting := e.lingering[source][key]; waiting && (round == 0 || round == pending) {
+				delete(e.lingering[source], key)
+			}
 			return nil
 		}
 		delete(heldSet, key)
@@ -207,6 +221,9 @@ func (e *Engine) sourceHeld(source device.Source) map[device.Key]holder {
 // Restore), so it can never collide with a release carried over from an
 // earlier incarnation.
 func (e *Engine) nextRound(source device.Source) int64 { return e.roundMax[source] + 1 }
+
+// Round reports the highest input round observed on one source.
+func (e *Engine) Round(source device.Source) int64 { return e.roundMax[source] }
 
 func (e *Engine) sourceLingering(source device.Source) map[device.Key]int64 {
 	set, ok := e.lingering[source]
@@ -437,13 +454,30 @@ func (e *Engine) markLingering(source device.Source, key device.Key, round int64
 }
 
 // Holders reports every input currently considered live, with the round that
-// owns it, sorted by source then key. Use it to audit which devices keep an
-// action active and which round each press/release belongs to.
-func (e *Engine) Holders() []HeldRef {
+// owns it, sorted by source then key.
+func (e *Engine) Holders() []HeldRef { return flattenHolders(e.held) }
+
+func flattenHolders(sets map[device.Source]map[device.Key]holder) []HeldRef {
 	var out []HeldRef
-	for source, set := range e.held {
+	for source, set := range sets {
 		for key, h := range set {
 			out = append(out, HeldRef{Source: source, Key: key, Round: h.round})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Source != out[j].Source {
+			return out[i].Source < out[j].Source
+		}
+		return out[i].Key < out[j].Key
+	})
+	return out
+}
+
+func flattenLingering(sets map[device.Source]map[device.Key]int64) []HeldRef {
+	var out []HeldRef
+	for source, set := range sets {
+		for key, round := range set {
+			out = append(out, HeldRef{Source: source, Key: key, Round: round})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -520,12 +554,6 @@ func containsKey(chord []device.Key, key device.Key) bool {
 	return false
 }
 
-// InputRef identifies one physical input on one input device.
-type InputRef struct {
-	Source device.Source `json:"source"`
-	Key    device.Key    `json:"key"`
-}
-
 // Snapshot is the persistable, JSON-serialisable part of the engine state:
 // enough to resume after a save/reload without carrying hidden physical
 // state across the restart.
@@ -533,9 +561,11 @@ type Snapshot struct {
 	// Context is the active context at save time.
 	Context string `json:"context"`
 	// Held lists inputs physically down at save time, sorted.
-	Held []InputRef `json:"held,omitempty"`
+	Held []HeldRef `json:"held,omitempty"`
 	// Lingering lists inputs whose releases are already known to be stale.
-	Lingering []InputRef `json:"lingering,omitempty"`
+	Lingering []HeldRef `json:"lingering,omitempty"`
+	// Rounds is the latest input round seen for each source.
+	Rounds map[device.Source]int64 `json:"rounds,omitempty"`
 	// Toggled lists binding ids whose switch is latched on, sorted.
 	Toggled []string `json:"toggled,omitempty"`
 }
@@ -545,8 +575,14 @@ type Snapshot struct {
 // corresponding physical inputs must be re-confirmed (see PendingReconfirm).
 func (e *Engine) Snapshot() Snapshot {
 	snap := Snapshot{Context: e.context}
-	snap.Held = flattenRefs(e.held)
-	snap.Lingering = flattenRefs(e.lingering)
+	snap.Held = flattenHolders(e.held)
+	snap.Lingering = flattenLingering(e.lingering)
+	if len(e.roundMax) > 0 {
+		snap.Rounds = make(map[device.Source]int64, len(e.roundMax))
+		for source, round := range e.roundMax {
+			snap.Rounds[source] = round
+		}
+	}
 	for id, on := range e.toggled {
 		if on {
 			snap.Toggled = append(snap.Toggled, id)
@@ -567,17 +603,28 @@ func (e *Engine) Restore(snap Snapshot, nowMs int64) []Event {
 	if e.context == "" {
 		e.context = e.cfg.Start
 	}
-	e.held = make(map[device.Source]map[device.Key]struct{})
-	e.lingering = make(map[device.Source]map[device.Key]struct{})
+	e.held = make(map[device.Source]map[device.Key]holder)
+	e.lingering = make(map[device.Source]map[device.Key]int64)
+	e.roundMax = make(map[device.Source]int64)
 	e.engaged = make(map[string]*engagement)
 	e.toggled = make(map[string]bool)
 	e.active = make(map[string]bool)
 	e.switches = nil
 	for _, ref := range snap.Held {
-		e.markLingering(ref.Source, ref.Key)
+		e.markLingering(ref.Source, ref.Key, ref.Round)
 	}
 	for _, ref := range snap.Lingering {
-		e.markLingering(ref.Source, ref.Key)
+		e.markLingering(ref.Source, ref.Key, ref.Round)
+	}
+	for source, round := range snap.Rounds {
+		if round > e.roundMax[source] {
+			e.roundMax[source] = round
+		}
+	}
+	for _, ref := range append(append([]HeldRef{}, snap.Held...), snap.Lingering...) {
+		if ref.Round > e.roundMax[ref.Source] {
+			e.roundMax[ref.Source] = ref.Round
+		}
 	}
 	var out []Event
 	for _, id := range snap.Toggled {
@@ -598,22 +645,6 @@ func (e *Engine) Restore(snap Snapshot, nowMs int64) []Event {
 // keys in the lingering set, sorted by source then key. After a Restore this
 // is exactly the set of inputs the caller must re-confirm (a fresh press)
 // before they can drive actions again; their stale releases are ignored.
-func (e *Engine) PendingReconfirm() []InputRef {
-	return flattenRefs(e.lingering)
-}
-
-func flattenRefs(sets map[device.Source]map[device.Key]struct{}) []InputRef {
-	var out []InputRef
-	for source, set := range sets {
-		for key := range set {
-			out = append(out, InputRef{Source: source, Key: key})
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Source != out[j].Source {
-			return out[i].Source < out[j].Source
-		}
-		return out[i].Key < out[j].Key
-	})
-	return out
+func (e *Engine) PendingReconfirm() []HeldRef {
+	return flattenLingering(e.lingering)
 }

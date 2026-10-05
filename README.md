@@ -41,9 +41,10 @@ Go 游戏输入运行库：把键盘式虚拟输入映射为可配置动作。�
 - **设备移除**：`Engine.DeviceRemoved(source, now)` 只清理该来源：其按住键转入
   该来源的 lingering（移除后或重连后迟到的抬起被吞掉），锁存开关复位一次；
   持续动作仅在没有其他设备仍满足组合键时才结束。重连的设备从干净状态开始，
-  不继承旧保持状态。`Engine.Blur` 与上下文切换仍是全局收尾。
+  不继承旧保持状态；重连设备使用 `NewVirtualKeyboardFromRound(source, Engine.Round(source))`
+  续上每设备轮次，旧轮消息不会与新轮碰撞。`Engine.Blur` 与上下文切换仍是全局收尾。
 - **可恢复快照**：`Engine.Snapshot()` 导出 JSON 可序列化状态（上下文、按住集合、
-  lingering、锁存开关）。`Engine.Restore(snap, now)` 重开后，保存时按住的输入
+  lingering、每设备轮次高水位、锁存开关）。`Engine.Restore(snap, now)` 重开后，保存时按住的输入
   一律视为未确认（进入 lingering）：旧抬起被吞掉，需重新按下确认；
   `Engine.PendingReconfirm()` 明确列出仍需重新确认的输入（按来源、键排序）。
   锁存的开关在恢复时各发一次 `Activate` 重新启用。

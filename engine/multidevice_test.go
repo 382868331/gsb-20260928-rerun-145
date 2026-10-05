@@ -154,12 +154,12 @@ func TestDeviceRemovalScopedAndReconnect(t *testing.T) {
 		t.Fatal("run must survive keyboard removal while the pad holds it")
 	}
 	// A late release from the removed keyboard arrives after removal.
-	if out := eng.ApplyEdge(device.Edge{Source: "kbd", Key: "Shift", Phase: device.Release}, 30); len(out) != 0 {
+	if out := eng.ApplyEdge(device.Edge{Source: "kbd", Key: "Shift", Phase: device.Release, Round: 1}, 30); len(out) != 0 {
 		t.Fatalf("late release from removed device must be swallowed, got %v", out)
 	}
 	// The keyboard reconnects: no held state carries over, a fresh press
 	// re-syncs it, and it must not produce a duplicate activation.
-	devs["kbd"] = device.NewVirtualKeyboard("kbd")
+	devs["kbd"] = device.NewVirtualKeyboardFromRound("kbd", eng.Round("kbd"))
 	if out := feed(eng, devs, "kbd", 40, "Shift", device.Press); len(out) != 0 {
 		t.Fatalf("re-joining an already-engaged action must not re-activate, got %v", out)
 	}
@@ -212,29 +212,100 @@ func TestSnapshotRestorePendingReconfirm(t *testing.T) {
 		t.Fatalf("restore must re-activate latched switches, got %v", got)
 	}
 	wantPending := []engine.InputRef{
-		{Source: "kbd", Key: "L"},
-		{Source: "kbd", Key: "Shift"},
-		{Source: "pad", Key: "Shift"},
+		{Source: "kbd", Key: "L", Round: 2},
+		{Source: "kbd", Key: "Shift", Round: 1},
+		{Source: "pad", Key: "Shift", Round: 1},
 	}
 	if got := eng2.PendingReconfirm(); !reflect.DeepEqual(got, wantPending) {
 		t.Fatalf("pending reconfirm = %v, want %v", got, wantPending)
 	}
 	// Releases left over from before the save are stale and swallowed.
-	if out := eng2.ApplyEdge(device.Edge{Source: "kbd", Key: "Shift", Phase: device.Release}, 1010); len(out) != 0 {
+	if out := eng2.ApplyEdge(device.Edge{Source: "kbd", Key: "Shift", Phase: device.Release, Round: 1}, 1010); len(out) != 0 {
 		t.Fatalf("pre-save release must not cancel anything, got %v", out)
 	}
-	if out := eng2.ApplyEdge(device.Edge{Source: "pad", Key: "Shift", Phase: device.Release}, 1020); len(out) != 0 {
+	if out := eng2.ApplyEdge(device.Edge{Source: "pad", Key: "Shift", Phase: device.Release, Round: 1}, 1020); len(out) != 0 {
 		t.Fatalf("pre-save release must not cancel anything, got %v", out)
 	}
 	// A fresh press re-confirms the input and starts a new round.
-	if out := eng2.ApplyEdge(device.Edge{Source: "kbd", Key: "Shift", Phase: device.Press}, 1030); countType(out, engine.Activate) != 1 {
+	if out := eng2.ApplyEdge(device.Edge{Source: "kbd", Key: "Shift", Phase: device.Press, Round: 3}, 1030); countType(out, engine.Activate) != 1 {
 		t.Fatalf("re-confirmed press must activate, got %v", out)
 	}
-	if got := eng2.PendingReconfirm(); !reflect.DeepEqual(got, []engine.InputRef{{Source: "kbd", Key: "L"}}) {
+	if got := eng2.PendingReconfirm(); !reflect.DeepEqual(got, []engine.InputRef{
+		{Source: "kbd", Key: "L", Round: 2},
+	}) {
 		t.Fatalf("pending after re-confirm = %v", got)
 	}
-	out = eng2.ApplyEdge(device.Edge{Source: "kbd", Key: "Shift", Phase: device.Release}, 1040)
+	out = eng2.ApplyEdge(device.Edge{Source: "kbd", Key: "Shift", Phase: device.Release, Round: 3}, 1040)
 	if countType(out, engine.Deactivate) != 1 {
 		t.Fatalf("release of the re-confirmed key must deactivate, got %v", out)
+	}
+}
+
+func TestBlurRepressThenOldReleaseOnlyEndsOldRound(t *testing.T) {
+	eng, devs := multiSetup(t, []config.Binding{
+		{ID: "run", Chord: []device.Key{"Shift"}, Mode: config.ModeHold, Action: "run"},
+	})
+
+	first := feed(eng, devs, "kbd", 0, "Shift", device.Press)
+	devs["kbd"].Reset()
+	blur := eng.Blur(10)
+	second := feed(eng, devs, "kbd", 20, "Shift", device.Press)
+	late := feed(eng, devs, "kbd", 30, "Shift", device.Release)
+	current := feed(eng, devs, "kbd", 40, "Shift", device.Release)
+
+	all := append(append(append(first, blur...), second...), append(late, current...)...)
+	if got := countType(all, engine.Activate); got != 2 {
+		t.Fatalf("activates=%d, want 2", got)
+	}
+	if got := countType(all, engine.Deactivate); got != 2 {
+		t.Fatalf("deactivates=%d, want 2", got)
+	}
+	if got := eng.Holders(); len(got) != 0 {
+		t.Fatalf("current release must clear its holder, got %v", got)
+	}
+}
+
+func TestDeviceReconnectContinuesRoundsAndSaveRestoresCounter(t *testing.T) {
+	bindings := []config.Binding{
+		{ID: "run", Chord: []device.Key{"Shift"}, Mode: config.ModeHold, Action: "run"},
+	}
+	eng, devs := multiSetup(t, bindings)
+
+	feed(eng, devs, "kbd", 0, "Shift", device.Press)
+	feed(eng, devs, "pad", 10, "Shift", device.Press)
+	eng.DeviceRemoved("kbd", 20)
+	late := feed(eng, devs, "kbd", 30, "Shift", device.Release)
+	if len(late) != 0 {
+		t.Fatalf("late removed-device release changed actions: %v", late)
+	}
+
+	devs["kbd"] = device.NewVirtualKeyboardFromRound("kbd", eng.Round("kbd"))
+	reconnected := feed(eng, devs, "kbd", 40, "Shift", device.Press)
+	releaseKbd := feed(eng, devs, "kbd", 50, "Shift", device.Release)
+	if len(reconnected) != 0 || len(releaseKbd) != 0 {
+		t.Fatalf("pad co-hold must keep action active: reconnect=%v release=%v", reconnected, releaseKbd)
+	}
+
+	snap := eng.Snapshot()
+	data, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var loaded engine.Snapshot
+	if err := json.Unmarshal(data, &loaded); err != nil {
+		t.Fatal(err)
+	}
+	cfg := compile(t, bindings)
+	restored := engine.New(cfg)
+	restored.Restore(loaded, 60)
+
+	devs["kbd"] = device.NewVirtualKeyboardFromRound("kbd", restored.Round("kbd"))
+	fresh := feed(restored, devs, "kbd", 70, "Shift", device.Press)
+	if countType(fresh, engine.Activate) != 1 {
+		t.Fatalf("fresh restored-device press must start its own action, got %v", fresh)
+	}
+	ending := feed(restored, devs, "kbd", 80, "Shift", device.Release)
+	if countType(ending, engine.Deactivate) != 1 {
+		t.Fatalf("new round release must end its own action, got %v", ending)
 	}
 }

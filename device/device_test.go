@@ -15,7 +15,7 @@ func TestDeduplicatesRepeatedMessages(t *testing.T) {
 		{Seq: 3, Key: "A", Phase: device.Press},
 	}
 	edge, ok := k.Push(presses[0])
-	if !ok || edge != (device.Edge{Key: "A", Phase: device.Press}) {
+	if !ok || edge != (device.Edge{Key: "A", Phase: device.Press, Round: 1}) {
 		t.Fatalf("first press should yield one edge, got %+v ok=%v", edge, ok)
 	}
 	for _, ev := range presses[1:] {
@@ -41,9 +41,9 @@ func TestBlurReleasesHeldKeysInOrder(t *testing.T) {
 	k.Push(device.Event{Seq: 3, Key: "M", Phase: device.Press})
 	edges := k.FocusChange(device.FocusEvent{Focused: false})
 	want := []device.Edge{
-		{Key: "A", Phase: device.Release},
-		{Key: "M", Phase: device.Release},
-		{Key: "Z", Phase: device.Release},
+		{Key: "A", Phase: device.Release, Round: 2},
+		{Key: "M", Phase: device.Release, Round: 3},
+		{Key: "Z", Phase: device.Release, Round: 1},
 	}
 	if !reflect.DeepEqual(edges, want) {
 		t.Fatalf("got %v want %v", edges, want)
@@ -59,6 +59,30 @@ func TestRegainFocusEmitsNothing(t *testing.T) {
 	k.FocusChange(device.FocusEvent{Focused: false})
 	if edges := k.FocusChange(device.FocusEvent{Focused: true}); len(edges) != 0 {
 		t.Fatalf("regaining focus emits no edges, got %v", edges)
+	}
+}
+
+func TestLateUnattributedReleaseAfterRepressKeepsItsRound(t *testing.T) {
+	k := device.NewVirtualKeyboard("kbd")
+	first, _ := k.Push(device.Event{Key: "A", Phase: device.Press})
+	forced := k.FocusChange(device.FocusEvent{Focused: false})
+	second, _ := k.Push(device.Event{Key: "A", Phase: device.Press})
+	late, ok := k.Push(device.Event{Key: "A", Phase: device.Release})
+	if !ok || late.Round != first.Round {
+		t.Fatalf("late release = %+v ok=%v, want old round %d", late, ok, first.Round)
+	}
+	if !k.Held("A") {
+		t.Fatal("late old-round release must not release the new press")
+	}
+	current, ok := k.Push(device.Event{Key: "A", Phase: device.Release})
+	if !ok || current.Round != second.Round {
+		t.Fatalf("new release = %+v ok=%v, want current round %d", current, ok, second.Round)
+	}
+	if k.Held("A") {
+		t.Fatal("the current round must release normally")
+	}
+	if forced[0].Round != first.Round {
+		t.Fatalf("forced release round = %d, want %d", forced[0].Round, first.Round)
 	}
 }
 

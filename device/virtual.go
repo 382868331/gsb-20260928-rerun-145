@@ -11,7 +11,10 @@ package device
 type VirtualKeyboard struct {
 	source Source
 	down   map[Key]int64 // key -> live round currently down
-	round  int64         // latest round handed out on this device
+	// released remembers rounds force-ended by blur/reset whose physical
+	// release message may still arrive after a newer press.
+	released map[Key]int64
+	round    int64 // latest round handed out on this device
 }
 
 // NewVirtualKeyboard creates an empty virtual keyboard. An optional source
@@ -22,7 +25,7 @@ func NewVirtualKeyboard(source ...Source) *VirtualKeyboard {
 	if len(source) > 0 {
 		src = source[0]
 	}
-	return &VirtualKeyboard{source: src, down: make(map[Key]int64)}
+	return &VirtualKeyboard{source: src, down: make(map[Key]int64), released: make(map[Key]int64)}
 }
 
 // NewVirtualKeyboardFromRound creates a device whose next minted round is
@@ -30,7 +33,7 @@ func NewVirtualKeyboard(source ...Source) *VirtualKeyboard {
 // rounds from the device's previous incarnation can never collide with the
 // new one.
 func NewVirtualKeyboardFromRound(source Source, round int64) *VirtualKeyboard {
-	return &VirtualKeyboard{source: source, down: make(map[Key]int64), round: round}
+	return &VirtualKeyboard{source: source, down: make(map[Key]int64), released: make(map[Key]int64), round: round}
 }
 
 // Round reports the latest round minted on this device (0 before any press).
@@ -50,9 +53,11 @@ func (k *VirtualKeyboard) Push(ev Event) (edge Edge, ok bool) {
 	switch {
 	case ev.Phase == Press && !held:
 		round := ev.Round
-		if round <= k.round {
+		if round == 0 {
 			k.round++
 			round = k.round
+		} else if round <= k.round {
+			return Edge{}, false
 		}
 		k.round = round
 		k.down[ev.Key] = round
@@ -60,7 +65,12 @@ func (k *VirtualKeyboard) Push(ev Event) (edge Edge, ok bool) {
 	case ev.Phase == Release:
 		round := ev.Round
 		if round == 0 {
-			if !held {
+			if held {
+				if staleRound, waiting := k.released[ev.Key]; waiting && staleRound < oldRound {
+					delete(k.released, ev.Key)
+					return k.edge(ev.Key, Release, staleRound), true
+				}
+			} else {
 				return Edge{}, false
 			}
 			round = oldRound
@@ -72,6 +82,7 @@ func (k *VirtualKeyboard) Push(ev Event) (edge Edge, ok bool) {
 		// in-order release look stale and could wedge an action on.
 		if held && round == oldRound {
 			delete(k.down, ev.Key)
+			delete(k.released, ev.Key)
 		}
 		return k.edge(ev.Key, Release, round), true
 	default:
@@ -101,6 +112,7 @@ func (k *VirtualKeyboard) FocusChange(ev FocusEvent) []Edge {
 	for _, key := range keys {
 		round := k.down[key]
 		delete(k.down, key)
+		k.released[key] = round
 		edges = append(edges, k.edge(key, Release, round))
 	}
 	return edges
