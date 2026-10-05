@@ -15,7 +15,7 @@ func TestDeduplicatesRepeatedMessages(t *testing.T) {
 		{Seq: 3, Key: "A", Phase: device.Press},
 	}
 	edge, ok := k.Push(presses[0])
-	if !ok || edge != (device.Edge{Key: "A", Phase: device.Press}) {
+	if !ok || edge != (device.Edge{Key: "A", Phase: device.Press, Round: 1}) {
 		t.Fatalf("first press should yield one edge, got %+v ok=%v", edge, ok)
 	}
 	for _, ev := range presses[1:] {
@@ -41,9 +41,9 @@ func TestBlurReleasesHeldKeysInOrder(t *testing.T) {
 	k.Push(device.Event{Seq: 3, Key: "M", Phase: device.Press})
 	edges := k.FocusChange(device.FocusEvent{Focused: false})
 	want := []device.Edge{
-		{Key: "A", Phase: device.Release},
-		{Key: "M", Phase: device.Release},
-		{Key: "Z", Phase: device.Release},
+		{Key: "A", Phase: device.Release, Round: 2},
+		{Key: "M", Phase: device.Release, Round: 3},
+		{Key: "Z", Phase: device.Release, Round: 1},
 	}
 	if !reflect.DeepEqual(edges, want) {
 		t.Fatalf("got %v want %v", edges, want)

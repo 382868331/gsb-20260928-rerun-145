@@ -61,7 +61,7 @@ type Engine struct {
 	// stale release from one device never cancels another device's input.
 	held      map[device.Source]map[device.Key]holder
 	lingering map[device.Source]map[device.Key]int64 // (source,key) -> last observed stale round
-	roundMax  map[device.Source]int64               // high-water round per source
+	roundMax  map[device.Source]int64                // high-water round per source
 	engaged   map[string]*engagement
 	toggled   map[string]bool  // binding id -> switch state (per context)
 	active    map[string]bool  // binding id currently emitting Activate
@@ -173,17 +173,18 @@ func (e *Engine) applyPhysical(source device.Source, key device.Key, phase devic
 		heldSet := e.held[source]
 		h, isHeld := heldSet[key]
 		if !isHeld {
-			// No live round for this input: remember the round the message
-			// belonged to so a duplicated stale release is recognisable, but
-			// it can never cancel a round that does not exist yet.
-			e.sourceLingering(source)[key] = round
+			// No live round for this input. If it was pending re-confirmation,
+			// this stale release resolves it (the key is now known to be up);
+			// anything else is a no-op and can never cancel a future round.
+			if set, ok := e.lingering[source]; ok {
+				delete(set, key)
+			}
 			return nil
 		}
 		if round != 0 && round != h.round {
 			// Provably belongs to an older (or unknown) round than the one
-			// currently held. Record it and leave the newer hold untouched:
+			// currently held. Ignore it and leave the newer hold untouched:
 			// this is the "new press arrived first, old release later" case.
-			e.sourceLingering(source)[key] = round
 			return nil
 		}
 		delete(heldSet, key)
@@ -455,6 +456,14 @@ func (e *Engine) Holders() []HeldRef {
 	return out
 }
 
+// HeldRef identifies one live input together with the input round that owns
+// it. It is the round-aware counterpart of InputRef.
+type HeldRef struct {
+	Source device.Source `json:"source"`
+	Key    device.Key    `json:"key"`
+	Round  int64         `json:"round"`
+}
+
 // Blur handles input-focus loss with the unified teardown: held keys are
 // released and latched switches are turned off, so no action (including
 // toggles such as a flashlight) stays active after the window loses focus.
@@ -532,12 +541,16 @@ type InputRef struct {
 type Snapshot struct {
 	// Context is the active context at save time.
 	Context string `json:"context"`
-	// Held lists inputs physically down at save time, sorted.
-	Held []InputRef `json:"held,omitempty"`
+	// Held lists inputs physically down at save time, with their rounds,
+	// sorted by source then key.
+	Held []HeldRef `json:"held,omitempty"`
 	// Lingering lists inputs whose releases are already known to be stale.
 	Lingering []InputRef `json:"lingering,omitempty"`
 	// Toggled lists binding ids whose switch is latched on, sorted.
 	Toggled []string `json:"toggled,omitempty"`
+	// RoundMax is the per-source high-water round, so rounds minted after a
+	// restore can never collide with rounds from before the save.
+	RoundMax map[device.Source]int64 `json:"round_max,omitempty"`
 }
 
 // Snapshot captures the recoverable engine state. In-progress holds and
@@ -545,7 +558,7 @@ type Snapshot struct {
 // corresponding physical inputs must be re-confirmed (see PendingReconfirm).
 func (e *Engine) Snapshot() Snapshot {
 	snap := Snapshot{Context: e.context}
-	snap.Held = flattenRefs(e.held)
+	snap.Held = e.Holders()
 	snap.Lingering = flattenRefs(e.lingering)
 	for id, on := range e.toggled {
 		if on {
@@ -553,6 +566,12 @@ func (e *Engine) Snapshot() Snapshot {
 		}
 	}
 	sort.Strings(snap.Toggled)
+	if len(e.roundMax) > 0 {
+		snap.RoundMax = make(map[device.Source]int64, len(e.roundMax))
+		for source, round := range e.roundMax {
+			snap.RoundMax[source] = round
+		}
+	}
 	return snap
 }
 
@@ -567,17 +586,24 @@ func (e *Engine) Restore(snap Snapshot, nowMs int64) []Event {
 	if e.context == "" {
 		e.context = e.cfg.Start
 	}
-	e.held = make(map[device.Source]map[device.Key]struct{})
-	e.lingering = make(map[device.Source]map[device.Key]struct{})
+	e.held = make(map[device.Source]map[device.Key]holder)
+	e.lingering = make(map[device.Source]map[device.Key]int64)
+	e.roundMax = make(map[device.Source]int64)
 	e.engaged = make(map[string]*engagement)
 	e.toggled = make(map[string]bool)
 	e.active = make(map[string]bool)
 	e.switches = nil
+	for source, round := range snap.RoundMax {
+		e.roundMax[source] = round
+	}
 	for _, ref := range snap.Held {
-		e.markLingering(ref.Source, ref.Key)
+		e.markLingering(ref.Source, ref.Key, ref.Round)
+		if ref.Round > e.roundMax[ref.Source] {
+			e.roundMax[ref.Source] = ref.Round
+		}
 	}
 	for _, ref := range snap.Lingering {
-		e.markLingering(ref.Source, ref.Key)
+		e.markLingering(ref.Source, ref.Key, 0)
 	}
 	var out []Event
 	for _, id := range snap.Toggled {
@@ -602,7 +628,7 @@ func (e *Engine) PendingReconfirm() []InputRef {
 	return flattenRefs(e.lingering)
 }
 
-func flattenRefs(sets map[device.Source]map[device.Key]struct{}) []InputRef {
+func flattenRefs(sets map[device.Source]map[device.Key]int64) []InputRef {
 	var out []InputRef
 	for source, set := range sets {
 		for key := range set {
